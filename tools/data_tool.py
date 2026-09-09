@@ -20,6 +20,7 @@ from pandas.api.types import (
 FileSource: TypeAlias = str | PathLike[str] | IO[bytes] | IO[str]
 DataSummary: TypeAlias = dict[str, Any]
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
+DERIVED_DATE_COLUMNS_ATTR = "fastbi_derived_date_columns"
 
 
 class DataToolError(ValueError):
@@ -45,7 +46,52 @@ def load_data(source: FileSource, filename: str | None = None) -> pd.DataFrame:
     if dataframe.empty:
         raise DataToolError("The uploaded dataset contains no data rows.")
 
-    return dataframe
+    return add_date_from_parts(dataframe)
+
+
+def add_date_from_parts(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Safely derive a datetime column from explicit year/month/day columns."""
+    result = dataframe.copy()
+    existing_derived = [
+        column
+        for column in result.attrs.get(DERIVED_DATE_COLUMNS_ATTR, [])
+        if column in result.columns and is_datetime64_any_dtype(result[column].dtype)
+    ]
+    if existing_derived:
+        result.attrs[DERIVED_DATE_COLUMNS_ATTR] = existing_derived
+        return result
+
+    date_parts = _find_date_part_columns(result)
+    if date_parts is None:
+        return result
+
+    numeric_parts = {
+        part: pd.to_numeric(result[column], errors="coerce")
+        for part, column in date_parts.items()
+    }
+    valid_parts = pd.Series(True, index=result.index)
+    ranges = {"year": (1, 9999), "month": (1, 12), "day": (1, 31)}
+    for part, values in numeric_parts.items():
+        lower, upper = ranges[part]
+        valid_parts &= values.notna()
+        valid_parts &= values.eq(values.round())
+        valid_parts &= values.between(lower, upper)
+
+    derived_dates = pd.Series(pd.NaT, index=result.index, dtype="datetime64[ns]")
+    if valid_parts.any():
+        valid_values = {
+            part: values.loc[valid_parts].astype("int64")
+            for part, values in numeric_parts.items()
+        }
+        derived_dates.loc[valid_parts] = pd.to_datetime(valid_values, errors="coerce")
+
+    if not derived_dates.notna().any():
+        return result
+
+    output_column = _available_date_column_name(result)
+    result[output_column] = derived_dates
+    result.attrs[DERIVED_DATE_COLUMNS_ATTR] = [output_column]
+    return result
 
 
 def analyze_dataframe(dataframe: pd.DataFrame) -> DataSummary:
@@ -96,6 +142,11 @@ def analyze_dataframe(dataframe: pd.DataFrame) -> DataSummary:
         "numeric_summary": numeric_summary,
         "categorical_summary": categorical_summary,
         "date_columns": date_columns,
+        "derived_date_columns": [
+            column
+            for column in dataframe.attrs.get(DERIVED_DATE_COLUMNS_ATTR, [])
+            if column in date_columns
+        ],
     }
 
 
@@ -112,6 +163,33 @@ def _get_extension(source: FileSource, filename: str | None) -> str:
     if source_name is None and isinstance(source, (str, PathLike)):
         source_name = str(source)
     return Path(str(source_name)).suffix.lower() if source_name else ""
+
+
+def _find_date_part_columns(
+    dataframe: pd.DataFrame,
+) -> dict[str, object] | None:
+    matches: dict[str, list[object]] = {"year": [], "month": [], "day": []}
+    for column in dataframe.columns:
+        if isinstance(column, str):
+            normalized = column.strip().lower()
+            if normalized in matches:
+                matches[normalized].append(column)
+
+    if any(len(columns) != 1 for columns in matches.values()):
+        return None
+    return {part: columns[0] for part, columns in matches.items()}
+
+
+def _available_date_column_name(dataframe: pd.DataFrame) -> str:
+    if "date" not in dataframe.columns:
+        return "date"
+
+    candidate = "date_from_parts"
+    suffix = 2
+    while candidate in dataframe.columns:
+        candidate = f"date_from_parts_{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _ensure_source_is_not_empty(source: FileSource) -> None:

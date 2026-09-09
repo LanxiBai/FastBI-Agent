@@ -9,6 +9,7 @@ import pandas as pd
 
 from tools.data_tool import (
     DataToolError,
+    add_date_from_parts,
     analyze_data_file,
     analyze_dataframe,
     load_data,
@@ -63,6 +64,48 @@ class DataToolTests(TestCase):
         summary = analyze_dataframe(dataframe)
 
         self.assertEqual(summary["duplicates"], 1)
+
+    def test_derives_date_from_valid_year_month_day_columns(self) -> None:
+        dataframe = pd.DataFrame(
+            {"year": [2026], "month": [9], "day": [9], "sales": [100]}
+        )
+
+        prepared = add_date_from_parts(dataframe)
+
+        self.assertIn("date", prepared.columns)
+        self.assertEqual(prepared.loc[0, "date"], pd.Timestamp("2026-09-09"))
+        self.assertTrue({"year", "month", "day"}.issubset(prepared.columns))
+        self.assertNotIn("date", dataframe.columns)
+
+    def test_load_data_applies_date_part_preprocessing(self) -> None:
+        csv_file = BytesIO(b"year,month,day,sales\n2026,9,9,100\n")
+
+        dataframe = load_data(csv_file, "sales.csv")
+
+        self.assertEqual(dataframe.loc[0, "date"], pd.Timestamp("2026-09-09"))
+
+    def test_invalid_date_parts_are_safely_coerced(self) -> None:
+        dataframe = pd.DataFrame(
+            {
+                "year": [2026, 2026],
+                "month": [2, 2],
+                "day": [28, 30],
+            }
+        )
+
+        prepared = add_date_from_parts(dataframe)
+
+        self.assertEqual(prepared.loc[0, "date"], pd.Timestamp("2026-02-28"))
+        self.assertTrue(pd.isna(prepared.loc[1, "date"]))
+
+    def test_does_not_derive_date_when_parts_are_missing_or_all_invalid(self) -> None:
+        missing_part = pd.DataFrame({"year": [2026], "month": [9]})
+        invalid_parts = pd.DataFrame(
+            {"year": [2026], "month": [13], "day": [1]}
+        )
+
+        self.assertNotIn("date", add_date_from_parts(missing_part).columns)
+        self.assertNotIn("date", add_date_from_parts(invalid_parts).columns)
 
     def test_rejects_unsupported_file_type(self) -> None:
         with self.assertRaisesRegex(DataToolError, "Unsupported file type"):
