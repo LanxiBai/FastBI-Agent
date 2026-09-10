@@ -1,54 +1,91 @@
-"""Minimal Streamlit entry point for the FastBI analyst agent."""
+"""Streamlit interface for FastBI dataset analysis."""
 
 import pandas as pd
 import streamlit as st
 
-from agents.analyst_agent import run_agent
+from agents.analyst_agent import AgentError, AgentRunResult, run_agent
 from tools.chart_tool import ChartToolError, generate_chart, suggest_chart
 from tools.data_tool import DataSummary, DataToolError, analyze_data_file
 
 
 def main() -> None:
-    """Show minimal dataset analysis and agent test interfaces."""
+    """Run the dataset summary, AI analysis, and manual chart interfaces."""
     st.title("FastBI-Agent")
 
-    st.subheader("Dataset analysis")
     uploaded_file = st.file_uploader(
         "Upload an Excel or CSV file", type=["xlsx", "xls", "csv"]
     )
+    user_question = st.text_input("Analysis question")
+
+    dataframe: pd.DataFrame | None = None
+    summary: DataSummary | None = None
+    data_error: str | None = None
     if uploaded_file is not None:
         try:
             dataframe, summary = analyze_data_file(uploaded_file, uploaded_file.name)
-            first_metric, second_metric, third_metric = st.columns(3)
-            first_metric.metric("Rows", summary["shape"]["rows"])
-            second_metric.metric("Columns", summary["shape"]["columns"])
-            third_metric.metric("Duplicate rows", summary["duplicates"])
-            st.json(summary)
-            st.caption("First 5 rows")
-            st.dataframe(dataframe.head())
-            _show_chart_controls(dataframe, summary)
+            _show_dataset_summary(dataframe, summary)
         except DataToolError as exc:
-            st.error(str(exc))
+            data_error = str(exc)
+            st.error(data_error)
 
-    st.divider()
-    st.subheader("Agent test")
-    user_input = st.text_input("Ask the analyst a question")
+    if st.button("Analyze"):
+        if uploaded_file is None:
+            st.error("Please upload an Excel or CSV file before analysis.")
+        elif not user_question.strip():
+            st.error("Please enter an analysis question.")
+        elif data_error or dataframe is None:
+            st.error("The dataset could not be analyzed. Fix the upload error first.")
+        else:
+            try:
+                with st.spinner("Analyzing the dataset..."):
+                    result = run_agent(user_question, dataframe)
+                _show_agent_result(result)
+            except (AgentError, ValueError) as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"The analysis request failed: {exc}")
 
-    if st.button("Run"):
-        if not user_input.strip():
-            st.warning("Please enter a question.")
-            return
+    if dataframe is not None and summary is not None:
+        with st.expander("Manual chart test"):
+            _show_chart_controls(dataframe, summary)
 
-        try:
-            with st.spinner("Thinking..."):
-                st.write(run_agent(user_input))
-        except ValueError as exc:
-            st.error(str(exc))
+
+def _show_dataset_summary(dataframe: pd.DataFrame, summary: DataSummary) -> None:
+    """Display a compact dataset overview."""
+    st.subheader("Dataset Summary")
+    first_metric, second_metric, third_metric = st.columns(3)
+    first_metric.metric("Rows", summary["shape"]["rows"])
+    second_metric.metric("Columns", summary["shape"]["columns"])
+    third_metric.metric("Duplicate rows", summary["duplicates"])
+    st.json(summary)
+    st.caption("First 5 rows")
+    st.dataframe(dataframe.head())
+
+
+def _show_agent_result(result: AgentRunResult) -> None:
+    """Display the LLM analysis and optional generated chart."""
+    st.subheader("AI Analysis")
+    st.markdown(result["final_response"])
+    calculation = result["calculation_result"]
+    if calculation["status"] == "success":
+        st.caption("Calculated results from the uploaded dataset")
+        st.dataframe(pd.DataFrame(calculation["records"]))
+        if calculation["truncated"]:
+            st.caption(f"Showing 100 of {calculation['total_groups']} groups.")
+    elif calculation["status"] in ("empty", "unavailable"):
+        st.info(calculation.get("reason", "No rows matched the requested filters."))
+
+    st.subheader("Recommended Visualization")
+    if result["chart_figure"] is not None:
+        st.plotly_chart(result["chart_figure"], use_container_width=True)
+    elif result["chart_result"]["status"] == "unavailable":
+        st.info(result["chart_result"]["message"])
+    else:
+        st.caption("No chart was needed for this question.")
 
 
 def _show_chart_controls(dataframe: pd.DataFrame, summary: DataSummary) -> None:
-    """Render minimal chart selection controls for an uploaded dataset."""
-    st.subheader("Data visualization")
+    """Render the existing manual chart selection controls."""
     try:
         suggestion = suggest_chart(dataframe)
         st.caption(f"Recommended: {suggestion['chart_type']}. {suggestion['reason']}")
